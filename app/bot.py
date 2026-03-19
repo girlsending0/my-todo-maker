@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import TodoCreate, TodoUpdate
 from app.crud import create_todo, get_todos_by_date, update_todo, delete_todo, get_incomplete_todos_for_date
-from app.parser import parse_todo
+from app.intent import parse_intent
 
 
 def _is_authorized(update: Update) -> bool:
@@ -118,23 +118,81 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
 
-    parsed = parse_todo(update.message.text)
-    todo = TodoCreate(
-        title=parsed.title,
-        due_date=parsed.due_date,
-        due_time=parsed.due_time,
-    )
-
-    db = await get_db()
     try:
-        result = await create_todo(db, todo)
-        time_str = f" {parsed.due_time.strftime('%H:%M')}" if parsed.due_time else ""
-        await update.message.reply_text(
-            f"📝 추가: {result['title']}\n"
-            f"📅 {parsed.due_date.strftime('%m/%d')}{time_str}"
-        )
-    finally:
-        await db.close()
+        result = await parse_intent(update.message.text)
+    except Exception:
+        await update.message.reply_text("메시지를 이해하지 못했어요. 다시 시도해주세요.")
+        return
+
+    intent = result.get("intent")
+
+    if intent == "add":
+        db = await get_db()
+        try:
+            lines = []
+            for item in result.get("todos", []):
+                due_time = None
+                if item.get("due_time"):
+                    h, m = item["due_time"].split(":")
+                    due_time = time(int(h), int(m))
+                todo = TodoCreate(
+                    title=item["title"],
+                    due_date=datetime.strptime(item["due_date"], "%Y-%m-%d").date(),
+                    due_time=due_time,
+                )
+                created = await create_todo(db, todo)
+                time_str = f" {item['due_time']}" if item.get("due_time") else ""
+                lines.append(f"📝 {created['title']} ({item['due_date'][5:]}{time_str})")
+            await update.message.reply_text("추가했어요!\n" + "\n".join(lines))
+        finally:
+            await db.close()
+
+    elif intent == "done":
+        todo_id = result.get("todo_id")
+        db = await get_db()
+        try:
+            updated = await update_todo(db, todo_id, TodoUpdate(is_completed=True))
+            if updated:
+                await update.message.reply_text(f"✅ 완료: {updated['title']}")
+            else:
+                await update.message.reply_text("해당 할 일을 찾을 수 없습니다.")
+        finally:
+            await db.close()
+
+    elif intent == "delete":
+        todo_id = result.get("todo_id")
+        db = await get_db()
+        try:
+            success = await delete_todo(db, todo_id)
+            if success:
+                await update.message.reply_text("🗑 삭제했습니다.")
+            else:
+                await update.message.reply_text("해당 할 일을 찾을 수 없습니다.")
+        finally:
+            await db.close()
+
+    elif intent == "list_today":
+        db = await get_db()
+        try:
+            todos = await get_todos_by_date(db, datetime.now().date())
+            text = _format_todo_list(todos, f"📋 오늘 ({datetime.now().strftime('%m/%d')}) 할 일:")
+            await update.message.reply_text(text)
+        finally:
+            await db.close()
+
+    elif intent == "list_tomorrow":
+        from datetime import timedelta
+        tomorrow = datetime.now().date() + timedelta(days=1)
+        db = await get_db()
+        try:
+            todos = await get_todos_by_date(db, tomorrow)
+            text = _format_todo_list(todos, f"📋 내일 ({tomorrow.strftime('%m/%d')}) 할 일:")
+            await update.message.reply_text(text)
+        finally:
+            await db.close()
+
+    else:
+        await update.message.reply_text("이해하지 못했어요. 할 일을 추가하거나 /today, /done 등을 사용해주세요.")
 
 
 def create_bot_app() -> Application:
